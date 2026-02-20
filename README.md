@@ -1,3 +1,9 @@
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/St4NNi/jam-rs/blob/main/LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/cpb.svg)](https://crates.io/crates/cpb)
+[![Codecov](https://codecov.io/github/St4NNi/cpb/coverage.svg?branch=main)](https://codecov.io/gh/St4NNi/cpb)
+[![Dependency status](https://deps.rs/repo/github/St4NNi/cpb/status.svg)](https://deps.rs/repo/github/St4NNi/cpb)
+
 # cpb
 
 A small utility for faster copying of files and directories, especially for ceph and nfs based filesystems.
