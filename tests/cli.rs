@@ -10,7 +10,7 @@ fn cli_main_copies_a_file() {
     fs::write(&source, b"copied via cli").expect("failed to write source");
 
     let destination = temp.path().join("destination.txt");
-    let status = Command::new(env!("CARGO_BIN_EXE_bettercp"))
+    let status = Command::new(env!("CARGO_BIN_EXE_cpb"))
         .arg(&source)
         .arg(&destination)
         .arg("--threads")
@@ -18,9 +18,9 @@ fn cli_main_copies_a_file() {
         .arg("--chunk-size")
         .arg((32 * 1024 * 1024).to_string())
         .status()
-        .expect("failed to execute bettercp");
+        .expect("failed to execute cpb");
 
-    assert!(status.success(), "bettercp exited with non-zero status");
+    assert!(status.success(), "cpb exited with non-zero status");
     assert_eq!(
         fs::read(&destination).expect("failed to read copied destination"),
         b"copied via cli"

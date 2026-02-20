@@ -1,0 +1,25 @@
+name: automatic_test_build_publish
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Enable Workflow Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Cargo publish    
+        run: cargo publish --token "$CRATES_TOKEN"
+        env:
+          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}

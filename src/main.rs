@@ -29,7 +29,7 @@ const FALLBACK_IO_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_SINGLE_FILE_RANGE_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "bettercp", about = "Parallel copy with reflink support")]
+#[command(name = "cpb", about = "Parallel copy with reflink support")]
 struct Args {
     input: PathBuf,
     output: PathBuf,
@@ -468,10 +468,7 @@ fn copy_range_with_read_write(
 
         let mut written = 0_usize;
         while written < bytes_read {
-            match destination.write_at(
-                &buffer[written..bytes_read],
-                offset + written as u64,
-            ) {
+            match destination.write_at(&buffer[written..bytes_read], offset + written as u64) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -2189,5 +2186,4 @@ mod tests {
             .expect_err("expected failure from destination collision");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
-
 }
