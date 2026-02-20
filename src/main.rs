@@ -27,26 +27,23 @@ static GLOBAL_ALLOCATOR: Jemalloc = Jemalloc;
 const MIN_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 const FALLBACK_IO_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_SINGLE_FILE_RANGE_SIZE: usize = 4 * 1024 * 1024;
+const MAX_WORKER_THREADS: usize = 32;
 
 #[derive(Debug, Parser)]
-#[command(name = "cpb", about = "Parallel copy with reflink support")]
+#[command(
+    name = "cpb",
+    about = "Parallel copy with reflink support",
+    override_usage = "cpb [OPTIONS] <SOURCE>... <DESTINATION>",
+    after_help = "Arguments:\n  <SOURCE>...   One or more source paths\n  <DESTINATION> Destination path (when using multiple sources, must be an existing directory)\n\nExamples:\n  cpb file1 file2 dir1\n  cpb source.txt destination.txt\n  cpb src_dir backup_root"
+)]
 struct Args {
-    input: PathBuf,
-    output: PathBuf,
     #[arg(
-        short,
-        long,
-        default_value_t = 32,
-        value_parser = parse_threads
+        required = true,
+        num_args = 2..,
+        value_name = "PATH",
+        help = "Paths where the last value is DESTINATION and preceding values are SOURCE(s)"
     )]
-    threads: usize,
-    #[arg(
-        short = 'c',
-        long,
-        default_value_t = MIN_CHUNK_SIZE,
-        value_parser = parse_chunk_size
-    )]
-    chunk_size: usize,
+    paths: Vec<PathBuf>,
     #[arg(long, default_value_t = false)]
     silent: bool,
 }
@@ -90,28 +87,26 @@ enum WorkItem {
     Symlink(usize),
 }
 
-fn parse_threads(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| "threads must be an integer".to_owned())?;
-    if (1..=32).contains(&parsed) {
-        Ok(parsed)
-    } else {
-        Err("threads must be in the range 1..=32".to_owned())
-    }
+fn default_worker_threads() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_WORKER_THREADS)
 }
 
-fn parse_chunk_size(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| "chunk-size must be an integer".to_owned())?;
-    if parsed >= MIN_CHUNK_SIZE {
-        Ok(parsed)
-    } else {
-        Err(format!(
-            "chunk-size must be at least {MIN_CHUNK_SIZE} bytes (32 MiB)"
-        ))
+fn split_sources_and_destination(paths: &[PathBuf]) -> io::Result<(&[PathBuf], &Path)> {
+    if paths.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one source and one destination path are required",
+        ));
     }
+
+    let destination = paths
+        .last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination path missing"))?;
+    let sources = &paths[..paths.len() - 1];
+    Ok((sources, destination.as_path()))
 }
 
 fn preserved_metadata_from(metadata: &fs::Metadata) -> PreservedMetadata {
@@ -341,6 +336,38 @@ fn build_copy_plan(input: &Path, output: &Path, walk_threads: usize) -> io::Resu
         io::ErrorKind::InvalidInput,
         "input must be a regular file, symlink, or directory",
     ))
+}
+
+fn build_copy_plan_for_sources(
+    sources: &[PathBuf],
+    output: &Path,
+    walk_threads: usize,
+) -> io::Result<CopyPlan> {
+    if sources.len() > 1 {
+        match fs::metadata(output) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) | Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination must be an existing directory when copying multiple sources",
+                ));
+            }
+        }
+    }
+
+    let mut merged_plan = CopyPlan::default();
+    for source in sources {
+        let mut source_plan = build_copy_plan(source, output, walk_threads)?;
+        merged_plan.file_jobs.append(&mut source_plan.file_jobs);
+        merged_plan
+            .symlink_jobs
+            .append(&mut source_plan.symlink_jobs);
+        merged_plan
+            .directory_metadata
+            .append(&mut source_plan.directory_metadata);
+    }
+
+    Ok(merged_plan)
 }
 
 fn split_ranges(total_size: u64, workers: usize) -> Vec<(u64, u64)> {
@@ -856,7 +883,10 @@ fn apply_preserved_metadata(plan: &CopyPlan) -> io::Result<()> {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let plan = build_copy_plan(&args.input, &args.output, args.threads)?;
+    let (sources, destination) = split_sources_and_destination(&args.paths)?;
+    let worker_threads = default_worker_threads();
+    let chunk_size = MIN_CHUNK_SIZE;
+    let plan = build_copy_plan_for_sources(sources, destination, worker_threads)?;
 
     let total_size = plan.file_jobs.iter().map(|job| job.size).sum::<u64>();
     let total_files = plan.file_jobs.len();
@@ -885,13 +915,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let copy_result = if total_files == 1 && total_symlinks == 0 {
-        copy_single_file_with_ranges(&plan.file_jobs[0], args.threads, args.chunk_size, &progress)
+        copy_single_file_with_ranges(&plan.file_jobs[0], worker_threads, chunk_size, &progress)
     } else {
         copy_jobs_with_pool(
             &plan.file_jobs,
             &plan.symlink_jobs,
-            args.threads,
-            args.chunk_size,
+            worker_threads,
+            chunk_size,
             &progress,
         )
     };
@@ -964,22 +994,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_threads_validates_bounds() {
-        assert_eq!(parse_threads("1").expect("threads=1 should parse"), 1);
-        assert_eq!(parse_threads("32").expect("threads=32 should parse"), 32);
-        assert!(parse_threads("0").is_err());
-        assert!(parse_threads("33").is_err());
-        assert!(parse_threads("not-a-number").is_err());
+    fn default_worker_threads_is_within_expected_bounds() {
+        let threads = default_worker_threads();
+        assert!((1..=MAX_WORKER_THREADS).contains(&threads));
     }
 
     #[test]
-    fn parse_chunk_size_validates_bounds() {
-        assert_eq!(
-            parse_chunk_size(&MIN_CHUNK_SIZE.to_string()).expect("minimum chunk size should parse"),
-            MIN_CHUNK_SIZE
-        );
-        assert!(parse_chunk_size(&(MIN_CHUNK_SIZE - 1).to_string()).is_err());
-        assert!(parse_chunk_size("not-a-number").is_err());
+    fn split_sources_and_destination_requires_at_least_two_paths() {
+        let error =
+            split_sources_and_destination(&[]).expect_err("splitting without paths should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let source = PathBuf::from("source");
+        let destination = PathBuf::from("destination");
+        let paths = vec![source.clone(), destination.clone()];
+        let (sources, resolved_destination) = split_sources_and_destination(&paths)
+            .expect("splitting source and destination should succeed");
+
+        assert_eq!(sources, &[source]);
+        assert_eq!(resolved_destination, destination);
     }
 
     #[test]
@@ -1615,10 +1648,7 @@ mod tests {
         fs::create_dir(&output_parent).expect("failed to create output parent directory");
 
         run(Args {
-            input: source.clone(),
-            output: output_parent.clone(),
-            threads: 4,
-            chunk_size: MIN_CHUNK_SIZE,
+            paths: vec![source.clone(), output_parent.clone()],
             silent: true,
         })
         .expect("end-to-end copy should succeed");
@@ -1699,10 +1729,7 @@ mod tests {
         fs::create_dir(&output_dir).expect("failed to create output directory");
 
         run(Args {
-            input: top_level_symlink.clone(),
-            output: output_dir.clone(),
-            threads: 2,
-            chunk_size: MIN_CHUNK_SIZE,
+            paths: vec![top_level_symlink.clone(), output_dir.clone()],
             silent: true,
         })
         .expect("top-level symlink copy should succeed");
@@ -1729,10 +1756,7 @@ mod tests {
             .expect("failed to write source file");
 
         let error = run(Args {
-            input: source.clone(),
-            output: source.join("nested-output"),
-            threads: 2,
-            chunk_size: MIN_CHUNK_SIZE,
+            paths: vec![source.clone(), source.join("nested-output")],
             silent: true,
         })
         .expect_err("copying into itself should fail");
@@ -1814,6 +1838,23 @@ mod tests {
         assert_eq!(plan.directory_metadata.len(), 0);
         assert_eq!(plan.file_jobs[0].destination, destination);
         assert_eq!(plan.file_jobs[0].metadata.mode & 0o777, 0o640);
+    }
+
+    #[test]
+    fn build_copy_plan_for_sources_requires_existing_directory_with_multiple_inputs() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let source_one = temp.path().join("source-one.txt");
+        let source_two = temp.path().join("source-two.txt");
+        write_file_with_mode(&source_one, b"one", 0o640).expect("failed to write source one");
+        write_file_with_mode(&source_two, b"two", 0o640).expect("failed to write source two");
+
+        let destination_file = temp.path().join("destination.txt");
+        write_file_with_mode(&destination_file, b"destination", 0o640)
+            .expect("failed to write destination file");
+
+        let error = build_copy_plan_for_sources(&[source_one, source_two], &destination_file, 2)
+            .expect_err("multiple sources should require destination directory");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2072,10 +2113,7 @@ mod tests {
 
         let destination = temp.path().join("destination-file.txt");
         run(Args {
-            input: source.clone(),
-            output: destination.clone(),
-            threads: 4,
-            chunk_size: MIN_CHUNK_SIZE,
+            paths: vec![source.clone(), destination.clone()],
             silent: true,
         })
         .expect("single file run should succeed");
@@ -2090,10 +2128,7 @@ mod tests {
             .expect("failed to create destination collision directory");
 
         let error = run(Args {
-            input: source,
-            output: output_dir,
-            threads: 4,
-            chunk_size: MIN_CHUNK_SIZE,
+            paths: vec![source, output_dir],
             silent: true,
         })
         .expect_err("run should surface copy failures");
