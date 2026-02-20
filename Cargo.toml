@@ -2,6 +2,13 @@
 name = "cpb"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
+repository = "https://github.com/St4NNi/cpb"
+description = "a faster, simpler alternative to cp"
+authors = ["Sebastian Beyvers <sebastian.beyvers@cb.jlug.de>"]
+license-file = "LICENSE"
+readme = "README.md"
+keywords = ["copy", "filesystem", "parallel"]
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
