@@ -15,3 +15,14 @@ You can install cpb using cargo:
 cargo install cpb
 ```
 
+## Usage
+
+```bash
+cpb [SOURCE(s)] [DESTINATION]
+```
+
+That's it. You can specify multiple sources, but the destination must be a directory. If you specify only one source, the destination can be a file or a directory. No flags, no options, just copy files and directories. There is a single flag `--silent` that will suppress all output, but other than that, there are no options.
+
+# License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
