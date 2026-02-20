@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-indicatif = "0.17"
+clap = { version = "4.5.60", features = ["derive"] }
+indicatif = "0.18.4"
+jwalk = "0.8"
 libc = "0.2"
+pathdiff = "0.2"
+reflink-copy = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = "0.5"
+tikv-jemallocator = "0.6.1"
