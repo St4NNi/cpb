@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -28,6 +28,20 @@ const MIN_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 const FALLBACK_IO_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_SINGLE_FILE_RANGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_WORKER_THREADS: usize = 32;
+const PROGRESS_FLUSH_THRESHOLD: u64 = 16 * 1024 * 1024;
+const REFLINK_STATE_UNKNOWN: u8 = 0;
+const REFLINK_STATE_ENABLED: u8 = 1;
+const REFLINK_STATE_DISABLED: u8 = 2;
+
+const AFS_SUPER_MAGIC: libc::c_long = 0x5346_414f;
+const CEPH_SUPER_MAGIC: libc::c_long = 0x00c3_6400;
+const CIFS_SUPER_MAGIC: libc::c_long = 0xff53_4d42;
+const CODA_SUPER_MAGIC: libc::c_long = 0x7375_7245;
+const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
+const NCP_SUPER_MAGIC: libc::c_long = 0x564c;
+const NFS_SUPER_MAGIC: libc::c_long = 0x6969;
+const SMB2_SUPER_MAGIC: libc::c_long = 0xfe53_4d42;
+const V9FS_SUPER_MAGIC: libc::c_long = 0x0102_1997;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -415,6 +429,57 @@ fn should_fallback_copy_file_range(error: &io::Error) -> bool {
     )
 }
 
+fn should_disable_reflink_after_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::ENOTTY)
+    )
+}
+
+fn path_filesystem_type(path: &Path) -> io::Result<libc::c_long> {
+    let path = path_to_c_string(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+
+    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result == 0 {
+        let stat = unsafe { stat.assume_init() };
+        return Ok(stat.f_type as libc::c_long);
+    }
+
+    Err(io::Error::last_os_error())
+}
+
+fn is_probably_remote_filesystem(fs_type: libc::c_long) -> bool {
+    matches!(
+        fs_type,
+        AFS_SUPER_MAGIC
+            | CEPH_SUPER_MAGIC
+            | CIFS_SUPER_MAGIC
+            | CODA_SUPER_MAGIC
+            | FUSE_SUPER_MAGIC
+            | NCP_SUPER_MAGIC
+            | NFS_SUPER_MAGIC
+            | SMB2_SUPER_MAGIC
+            | V9FS_SUPER_MAGIC
+    )
+}
+
+fn should_parallelize_single_file(job: &FileJob) -> bool {
+    let destination_probe = match job.destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+
+    let source_is_remote = path_filesystem_type(&job.source)
+        .map(is_probably_remote_filesystem)
+        .unwrap_or(true);
+    let destination_is_remote = path_filesystem_type(destination_probe)
+        .map(is_probably_remote_filesystem)
+        .unwrap_or(true);
+
+    source_is_remote || destination_is_remote
+}
+
 fn remove_existing_non_directory_destination(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
@@ -445,15 +510,28 @@ fn prepare_destination_file(path: &Path, size: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn try_reflink(job: &FileJob, progress: &ProgressBar) -> io::Result<bool> {
+fn try_reflink(
+    job: &FileJob,
+    progress: &ProgressBar,
+    reflink_state: &AtomicU8,
+) -> io::Result<bool> {
+    if reflink_state.load(Ordering::Relaxed) == REFLINK_STATE_DISABLED {
+        return Ok(false);
+    }
+
     remove_existing_non_directory_destination(&job.destination)?;
 
     match reflink_copy::reflink(&job.source, &job.destination) {
         Ok(()) => {
+            reflink_state.store(REFLINK_STATE_ENABLED, Ordering::Relaxed);
             progress.inc(job.size);
             Ok(true)
         }
-        Err(_) => {
+        Err(error) => {
+            if should_disable_reflink_after_error(&error) {
+                reflink_state.store(REFLINK_STATE_DISABLED, Ordering::Relaxed);
+            }
+
             match fs::remove_file(&job.destination) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -475,6 +553,7 @@ fn copy_range_with_read_write(
     let io_chunk_size = chunk_size.clamp(64 * 1024, FALLBACK_IO_CHUNK_SIZE);
     let mut offset = start;
     let mut remaining = len;
+    let mut progress_pending = 0_u64;
     let mut buffer = vec![0_u8; io_chunk_size];
 
     while remaining > 0 {
@@ -488,7 +567,12 @@ fn copy_range_with_read_write(
                     ));
                 }
                 Ok(read) => break read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        || error.raw_os_error() == Some(libc::EAGAIN) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error),
             }
         };
@@ -503,7 +587,12 @@ fn copy_range_with_read_write(
                     ));
                 }
                 Ok(count) => written += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        || error.raw_os_error() == Some(libc::EAGAIN) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -511,7 +600,15 @@ fn copy_range_with_read_write(
         let copied = written as u64;
         remaining -= copied;
         offset += copied;
-        progress.inc(copied);
+        progress_pending += copied;
+        if progress_pending >= PROGRESS_FLUSH_THRESHOLD {
+            progress.inc(progress_pending);
+            progress_pending = 0;
+        }
+    }
+
+    if progress_pending > 0 {
+        progress.inc(progress_pending);
     }
 
     Ok(())
@@ -544,18 +641,24 @@ where
     let mut out_offset = in_offset;
 
     let mut remaining = len;
+    let mut progress_pending = 0_u64;
     while remaining > 0 {
         let to_copy = remaining.min(chunk_size as u64) as usize;
         let copied = copy_syscall(src_fd, &mut in_offset, dst_fd, &mut out_offset, to_copy);
 
         if copied < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
+            if error.kind() == io::ErrorKind::Interrupted
+                || error.raw_os_error() == Some(libc::EAGAIN)
+            {
                 continue;
             }
 
             if should_fallback_copy_file_range(&error) {
                 let offset = in_offset as u64;
+                if progress_pending > 0 {
+                    progress.inc(progress_pending);
+                }
                 return copy_range_with_read_write(
                     &src, &dst, offset, remaining, chunk_size, progress,
                 );
@@ -573,7 +676,15 @@ where
 
         let copied = copied as u64;
         remaining -= copied;
-        progress.inc(copied);
+        progress_pending += copied;
+        if progress_pending >= PROGRESS_FLUSH_THRESHOLD {
+            progress.inc(progress_pending);
+            progress_pending = 0;
+        }
+    }
+
+    if progress_pending > 0 {
+        progress.inc(progress_pending);
     }
 
     Ok(())
@@ -607,14 +718,19 @@ fn copy_range(
     )
 }
 
-fn copy_file_job(job: &FileJob, chunk_size: usize, progress: &ProgressBar) -> io::Result<()> {
+fn copy_file_job(
+    job: &FileJob,
+    chunk_size: usize,
+    progress: &ProgressBar,
+    reflink_state: &AtomicU8,
+) -> io::Result<()> {
     if job.size == 0 {
         remove_existing_non_directory_destination(&job.destination)?;
         prepare_destination_file(&job.destination, 0)?;
         return Ok(());
     }
 
-    if try_reflink(job, progress)? {
+    if try_reflink(job, progress, reflink_state)? {
         return Ok(());
     }
 
@@ -648,6 +764,7 @@ fn copy_single_file_with_ranges(
     threads: usize,
     chunk_size: usize,
     progress: &ProgressBar,
+    reflink_state: &AtomicU8,
 ) -> io::Result<()> {
     if job.size == 0 {
         remove_existing_non_directory_destination(&job.destination)?;
@@ -655,13 +772,29 @@ fn copy_single_file_with_ranges(
         return Ok(());
     }
 
-    if try_reflink(job, progress)? {
+    if try_reflink(job, progress, reflink_state)? {
         return Ok(());
     }
 
     prepare_destination_file(&job.destination, job.size)?;
 
-    let worker_count = single_file_worker_count(job.size, threads);
+    let worker_count = if should_parallelize_single_file(job) {
+        single_file_worker_count(job.size, threads)
+    } else {
+        1
+    };
+
+    if worker_count == 1 {
+        return copy_range(
+            &job.source,
+            &job.destination,
+            0,
+            job.size,
+            chunk_size,
+            progress,
+        );
+    }
+
     let ranges = split_ranges(job.size, worker_count);
 
     let mut handles = Vec::with_capacity(ranges.len());
@@ -700,6 +833,7 @@ fn copy_jobs_with_pool(
     threads: usize,
     chunk_size: usize,
     progress: &ProgressBar,
+    reflink_state: Arc<AtomicU8>,
 ) -> io::Result<()> {
     let total_jobs = file_jobs.len() + symlink_jobs.len();
     if total_jobs == 0 {
@@ -729,6 +863,7 @@ fn copy_jobs_with_pool(
         let has_failed = Arc::clone(&has_failed);
         let first_error = Arc::clone(&first_error);
         let thread_progress = progress.clone();
+        let reflink_state = Arc::clone(&reflink_state);
 
         handles.push(thread::spawn(move || {
             loop {
@@ -748,9 +883,12 @@ fn copy_jobs_with_pool(
                 };
 
                 let job_result = match next_job {
-                    WorkItem::File(index) => {
-                        copy_file_job(&shared_file_jobs[index], chunk_size, &thread_progress)
-                    }
+                    WorkItem::File(index) => copy_file_job(
+                        &shared_file_jobs[index],
+                        chunk_size,
+                        &thread_progress,
+                        &reflink_state,
+                    ),
                     WorkItem::Symlink(index) => copy_symlink_job(&shared_symlink_jobs[index]),
                 };
 
@@ -792,6 +930,10 @@ fn should_ignore_ownership_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EOPNOTSUPP)
     )
+}
+
+fn can_preserve_ownership() -> bool {
+    unsafe { libc::geteuid() == 0 }
 }
 
 fn set_path_owner(
@@ -859,8 +1001,12 @@ fn set_path_timestamps(
 }
 
 fn apply_preserved_metadata(plan: &CopyPlan) -> io::Result<()> {
+    let preserve_ownership = can_preserve_ownership();
+
     for job in &plan.file_jobs {
-        set_path_owner(&job.destination, job.metadata, true)?;
+        if preserve_ownership {
+            set_path_owner(&job.destination, job.metadata, true)?;
+        }
         fs::set_permissions(
             &job.destination,
             fs::Permissions::from_mode(job.metadata.mode),
@@ -869,12 +1015,16 @@ fn apply_preserved_metadata(plan: &CopyPlan) -> io::Result<()> {
     }
 
     for job in &plan.symlink_jobs {
-        set_path_owner(&job.destination, job.metadata, false)?;
+        if preserve_ownership {
+            set_path_owner(&job.destination, job.metadata, false)?;
+        }
         set_path_timestamps(&job.destination, job.metadata, false)?;
     }
 
     for (directory, metadata) in plan.directory_metadata.iter().rev() {
-        set_path_owner(directory, *metadata, true)?;
+        if preserve_ownership {
+            set_path_owner(directory, *metadata, true)?;
+        }
         fs::set_permissions(directory, fs::Permissions::from_mode(metadata.mode))?;
         set_path_timestamps(directory, *metadata, true)?;
     }
@@ -886,6 +1036,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (sources, destination) = split_sources_and_destination(&args.paths)?;
     let worker_threads = default_worker_threads();
     let chunk_size = MIN_CHUNK_SIZE;
+    let reflink_state = Arc::new(AtomicU8::new(REFLINK_STATE_UNKNOWN));
     let plan = build_copy_plan_for_sources(sources, destination, worker_threads)?;
 
     let total_size = plan.file_jobs.iter().map(|job| job.size).sum::<u64>();
@@ -915,7 +1066,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let copy_result = if total_files == 1 && total_symlinks == 0 {
-        copy_single_file_with_ranges(&plan.file_jobs[0], worker_threads, chunk_size, &progress)
+        copy_single_file_with_ranges(
+            &plan.file_jobs[0],
+            worker_threads,
+            chunk_size,
+            &progress,
+            &reflink_state,
+        )
     } else {
         copy_jobs_with_pool(
             &plan.file_jobs,
@@ -923,6 +1080,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             worker_threads,
             chunk_size,
             &progress,
+            Arc::clone(&reflink_state),
         )
     };
 
@@ -1160,6 +1318,31 @@ mod tests {
         ));
         assert!(!should_fallback_copy_file_range(
             &io::Error::from_raw_os_error(libc::EACCES)
+        ));
+    }
+
+    #[test]
+    fn should_disable_reflink_after_error_matches_expected_errno_values() {
+        assert!(should_disable_reflink_after_error(
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        ));
+        assert!(should_disable_reflink_after_error(
+            &io::Error::from_raw_os_error(libc::ENOSYS)
+        ));
+        assert!(should_disable_reflink_after_error(
+            &io::Error::from_raw_os_error(libc::ENOTTY)
+        ));
+        assert!(!should_disable_reflink_after_error(
+            &io::Error::from_raw_os_error(libc::EXDEV)
+        ));
+    }
+
+    #[test]
+    fn is_probably_remote_filesystem_matches_known_superblocks() {
+        assert!(is_probably_remote_filesystem(NFS_SUPER_MAGIC));
+        assert!(is_probably_remote_filesystem(CEPH_SUPER_MAGIC));
+        assert!(!is_probably_remote_filesystem(
+            libc::TMPFS_MAGIC as libc::c_long
         ));
     }
 
@@ -1431,8 +1614,14 @@ mod tests {
         let job = file_job_from_paths(&source, &destination);
 
         let progress = ProgressBar::hidden();
-        copy_single_file_with_ranges(&job, 4, MIN_CHUNK_SIZE, &progress)
-            .expect("single-file range copy should succeed");
+        copy_single_file_with_ranges(
+            &job,
+            4,
+            MIN_CHUNK_SIZE,
+            &progress,
+            &AtomicU8::new(REFLINK_STATE_UNKNOWN),
+        )
+        .expect("single-file range copy should succeed");
 
         assert_eq!(
             fs::read(&destination).expect("failed to read destination"),
@@ -1499,8 +1688,15 @@ mod tests {
 
         prepare_destination_layout(&plan).expect("failed to prepare destination layout");
         let progress = ProgressBar::hidden();
-        copy_jobs_with_pool(&file_jobs, &symlink_jobs, 4, MIN_CHUNK_SIZE, &progress)
-            .expect("copy pool should complete successfully");
+        copy_jobs_with_pool(
+            &file_jobs,
+            &symlink_jobs,
+            4,
+            MIN_CHUNK_SIZE,
+            &progress,
+            Arc::new(AtomicU8::new(REFLINK_STATE_UNKNOWN)),
+        )
+        .expect("copy pool should complete successfully");
         apply_preserved_metadata(&plan).expect("metadata application should succeed");
 
         assert_eq!(
@@ -1536,8 +1732,15 @@ mod tests {
 
         let job = file_job_from_paths(&source, &destination_directory);
         let progress = ProgressBar::hidden();
-        let error = copy_jobs_with_pool(&[job], &[], 1, MIN_CHUNK_SIZE, &progress)
-            .expect_err("expected worker error for directory destination");
+        let error = copy_jobs_with_pool(
+            &[job],
+            &[],
+            1,
+            MIN_CHUNK_SIZE,
+            &progress,
+            Arc::new(AtomicU8::new(REFLINK_STATE_UNKNOWN)),
+        )
+        .expect_err("expected worker error for directory destination");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
@@ -2056,8 +2259,13 @@ mod tests {
 
         let destination_job = temp.path().join("empty-job.bin");
         let job = file_job_from_paths(&source, &destination_job);
-        copy_file_job(&job, MIN_CHUNK_SIZE, &ProgressBar::hidden())
-            .expect("empty file copy job should succeed");
+        copy_file_job(
+            &job,
+            MIN_CHUNK_SIZE,
+            &ProgressBar::hidden(),
+            &AtomicU8::new(REFLINK_STATE_UNKNOWN),
+        )
+        .expect("empty file copy job should succeed");
         assert_eq!(
             fs::metadata(&destination_job)
                 .expect("failed to stat destination")
@@ -2067,8 +2275,14 @@ mod tests {
 
         let destination_ranges = temp.path().join("empty-ranges.bin");
         let ranges_job = file_job_from_paths(&source, &destination_ranges);
-        copy_single_file_with_ranges(&ranges_job, 4, MIN_CHUNK_SIZE, &ProgressBar::hidden())
-            .expect("empty single-file range copy should succeed");
+        copy_single_file_with_ranges(
+            &ranges_job,
+            4,
+            MIN_CHUNK_SIZE,
+            &ProgressBar::hidden(),
+            &AtomicU8::new(REFLINK_STATE_UNKNOWN),
+        )
+        .expect("empty single-file range copy should succeed");
         assert_eq!(
             fs::metadata(&destination_ranges)
                 .expect("failed to stat range destination")
@@ -2101,8 +2315,15 @@ mod tests {
 
     #[test]
     fn copy_jobs_with_pool_accepts_empty_job_list() {
-        copy_jobs_with_pool(&[], &[], 4, MIN_CHUNK_SIZE, &ProgressBar::hidden())
-            .expect("empty job list should be a no-op");
+        copy_jobs_with_pool(
+            &[],
+            &[],
+            4,
+            MIN_CHUNK_SIZE,
+            &ProgressBar::hidden(),
+            Arc::new(AtomicU8::new(REFLINK_STATE_UNKNOWN)),
+        )
+        .expect("empty job list should be a no-op");
     }
 
     #[test]
@@ -2217,8 +2438,15 @@ mod tests {
         };
         prepare_destination_layout(&plan).expect("failed to prepare destination layout");
 
-        let error = copy_jobs_with_pool(&file_jobs, &[], 6, MIN_CHUNK_SIZE, &ProgressBar::hidden())
-            .expect_err("expected failure from destination collision");
+        let error = copy_jobs_with_pool(
+            &file_jobs,
+            &[],
+            6,
+            MIN_CHUNK_SIZE,
+            &ProgressBar::hidden(),
+            Arc::new(AtomicU8::new(REFLINK_STATE_UNKNOWN)),
+        )
+        .expect_err("expected failure from destination collision");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 }

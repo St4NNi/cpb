@@ -19,7 +19,7 @@ pathdiff = "0.2"
 reflink-copy = "0.1"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.26.0"
 
 [target.'cfg(target_env = "musl")'.dependencies]
 tikv-jemallocator = "0.6.1"
